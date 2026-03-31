@@ -1,0 +1,19 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Project-specific generated files
+faiss_index.faiss
+metadata.json
+*.pth
+*.backup
+
+# Image directories
+images/
+static/uploads/
+.git-ignore
+*.zip
+*.md
+.github/
+.venv/
+a.py

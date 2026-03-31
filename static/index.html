@@ -1,0 +1,114 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Image Search</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <link rel="stylesheet" href="static\styles.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+
+                <h1>Semantic Image Retrieval</h1>
+            </div>
+        </header>
+
+        <section class="glass-card upload-section">
+            <div class="section-header">
+                <div class="icon-wrapper">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <h2>Upload Images</h2>
+            </div>
+            <form id="uploadForm" action="#" method="post" enctype="multipart/form-data">
+                <div class="file-input-wrapper">
+                    <input type="file" name="files" id="uploadFiles" required multiple accept="image/*">
+                    <label for="uploadFiles" class="file-input-label">
+                        <span class="file-icon">📁</span>
+                        <span class="file-text">Choose images or drag & drop</span>
+                        <span class="file-hint">Support for JPG, PNG, WebP</span>
+                    </label>
+                </div>
+                <button type="submit" class="btn btn-primary">
+                    <span>Upload & Index</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M5 12h14M12 5l7 7-7 7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </form>
+            <div id="uploadMessage" class="message"></div>
+        </section>
+
+        <section class="glass-card search-section">
+            <div class="section-header">
+                <div class="icon-wrapper">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <circle cx="11" cy="11" r="8" stroke-width="2"/>
+                        <path d="M21 21l-4.35-4.35" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <h2>Search Database</h2>
+            </div>
+            <form id="searchForm" action="#" method="post" enctype="multipart/form-data">
+                <div class="search-tabs">
+                    <button type="button" class="tab-btn active" data-tab="text">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M4 7h16M4 12h16M4 17h10" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                        Text Search
+                    </button>
+                    <button type="button" class="tab-btn" data-tab="image">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <rect x="3" y="3" width="18" height="18" rx="2" stroke-width="2"/>
+                            <circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/>
+                            <path d="M21 15l-5-5L5 21" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        Image Search
+                    </button>
+                </div>
+                
+                <div class="tab-content active" id="textTab">
+                    <div class="input-wrapper">
+                        <input type="text" name="query_text" id="queryText" placeholder="Describe what you're looking for..." class="text-input">
+                    </div>
+                </div>
+                
+                <div class="tab-content" id="imageTab">
+                    <div class="file-input-wrapper">
+                        <input type="file" name="query_image" id="queryImage" accept="image/*">
+                        <label for="queryImage" class="file-input-label small">
+                            <span class="file-icon">🖼️</span>
+                            <span class="file-text">Upload search image</span>
+                        </label>
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn btn-secondary">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <circle cx="11" cy="11" r="8" stroke-width="2"/>
+                        <path d="M21 21l-4.35-4.35" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                    <span>Search</span>
+                </button>
+            </form>
+        </section>
+
+        <section class="results-container" id="resultsContainer" style="display: none;">
+            <div class="section-header">
+                <h2>Search Results</h2>
+            </div>
+            <div id="results" class="results-grid"></div>
+        </section>
+    </div>
+
+    <script src="static/app.js"></script>
+</body>
+</html>
