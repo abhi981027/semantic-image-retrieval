@@ -386,12 +386,130 @@ body {
 .result-image-container img {
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    /* contain (not cover) so the whole frame is visible and bounding boxes line up */
+    object-fit: contain;
     transition: transform 0.3s ease;
 }
 
-.result-card:hover .result-image-container img {
-    transform: scale(1.02);
+.timestamp-chip {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: rgba(26, 32, 44, 0.8);
+    color: white;
+    font-size: 0.8rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.source-line span:last-child {
+    overflow-wrap: anywhere;
+}
+
+/* Video upload options */
+.video-options {
+    margin-bottom: 24px;
+    font-size: 0.9rem;
+}
+
+.video-options summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.options-grid,
+.search-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+}
+
+.options-grid {
+    margin-top: 16px;
+}
+
+.search-options {
+    margin-bottom: 24px;
+}
+
+.options-grid label,
+.search-options label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.options-grid .hint {
+    font-weight: 400;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+
+.options-grid input,
+.options-grid select,
+.search-options select {
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.95rem;
+}
+
+.btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+/* Video progress */
+.video-progress {
+    margin-top: 20px;
+    padding: 16px 18px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--bg-secondary);
+}
+
+.progress-label {
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.progress-track {
+    height: 8px;
+    border-radius: 4px;
+    background: var(--border-color);
+    overflow: hidden;
+}
+
+.progress-fill {
+    height: 100%;
+    width: 0;
+    background: var(--primary);
+    transition: width 0.4s ease;
+}
+
+.video-progress[data-stage="error"] .progress-fill {
+    background: #e53e3e;
+    width: 100% !important;
+}
+
+.progress-detail {
+    margin-top: 10px;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
+.results-summary {
+    margin-left: auto;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
 }
 
 .detection-box {

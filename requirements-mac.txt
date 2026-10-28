@@ -1,0 +1,15 @@
+torch
+torchvision
+torchaudio
+faiss-cpu==1.12.0
+fastapi==0.120.4
+pillow==11.3.0
+transformers==4.57.1
+uvicorn==0.38.0
+python-multipart==0.0.20
+requests==2.32.5
+segment_anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf
+numpy
+huggingface-hub
+opencv-python
+psutil

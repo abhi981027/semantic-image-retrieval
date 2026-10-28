@@ -105,14 +105,27 @@ document.getElementById('searchForm').addEventListener('submit', async function(
     // Scroll to results
     resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
+    const summary = document.getElementById('resultsSummary');
+    summary.textContent = '';
+
     try {
         const response = await fetch('/search/', {
             method: 'POST',
             body: formData
         });
-        
+
         const data = await response.json();
+        if (!response.ok) {
+            resultsDiv.innerHTML = '';
+            resultsDiv.appendChild(emptyState('⚠️', data.detail || 'Search failed.'));
+            return;
+        }
         displayResults(data.results || []);
+        if (data.timing) {
+            const n = (data.results || []).length;
+            summary.textContent = `${n} result${n === 1 ? '' : 's'} · search ${data.timing.search_ms.toFixed(0)} ms` +
+                ` (+ ${(data.timing.model_load_ms / 1000).toFixed(1)} s model load)`;
+        }
     } catch (error) {
         resultsDiv.innerHTML = `
             <div class="empty-state">
@@ -149,39 +162,40 @@ function displayResults(results) {
         const img = document.createElement('img');
         img.src = result.image_url;
         img.alt = `Result ${index + 1}`;
-        
+
         // Handle bounding box for object detection
         img.onload = () => {
             if (result.type === 'object' && result.box) {
                 const boxDiv = document.createElement('div');
                 boxDiv.className = 'detection-box';
-                
-                // Calculate scaling factor
-                const scaleX = img.width / img.naturalWidth;
-                const scaleY = img.height / img.naturalHeight;
-                
-                // Apply scaled coordinates
-                const left = result.box[0] * scaleX;
-                const top = result.box[1] * scaleY;
-                const width = (result.box[2] - result.box[0]) * scaleX;
-                const height = (result.box[3] - result.box[1]) * scaleY;
-                
-                boxDiv.style.left = left + 'px';
-                boxDiv.style.top = top + 'px';
-                boxDiv.style.width = width + 'px';
-                boxDiv.style.height = height + 'px';
-                
+                boxDiv.dataset.box = JSON.stringify(result.box);
                 imageContainer.appendChild(boxDiv);
+                placeBox(img, boxDiv);
             }
         };
-        
+
         imageContainer.appendChild(img);
+        if (result.timestamp) {
+            const ts = document.createElement('span');
+            ts.className = 'timestamp-chip';
+            ts.textContent = result.timestamp;
+            imageContainer.appendChild(ts);
+        }
         resultCard.appendChild(imageContainer);
-        
+
         const resultInfo = document.createElement('div');
         resultInfo.className = 'result-info';
-        
+
         const scorePercentage = (result.score * 100).toFixed(1);
+        const sourceLine = result.source_video ? `
+                <div class="meta-item source-line">
+                    <span class="meta-label">Source:</span>
+                    <span>${escapeHtml(result.video_name)} @ ${escapeHtml(result.timestamp || '')}</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Frame:</span>
+                    <span>#${result.frame_number}</span>
+                </div>` : '';
         resultInfo.innerHTML = `
             <div class="result-score">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
@@ -191,6 +205,7 @@ function displayResults(results) {
                 ${scorePercentage}% Match
             </div>
             <div class="result-meta">
+                ${sourceLine}
                 <div class="meta-item">
                     <span class="meta-label">Type:</span>
                     <span class="type-badge ${result.type}">${result.type}</span>
@@ -208,6 +223,162 @@ function displayResults(results) {
         resultsDiv.appendChild(resultCard);
     });
 }
+
+// Place a bounding box over an image shown with object-fit: contain.
+// The image may be letterboxed inside its container, so add the offset of the drawn area.
+function placeBox(img, boxDiv) {
+    const box = JSON.parse(boxDiv.dataset.box);
+    const cw = img.clientWidth, ch = img.clientHeight;
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    if (!nw || !nh) return;
+    const scale = Math.min(cw / nw, ch / nh);
+    const offX = (cw - nw * scale) / 2;
+    const offY = (ch - nh * scale) / 2;
+    boxDiv.style.left = (offX + box[0] * scale) + 'px';
+    boxDiv.style.top = (offY + box[1] * scale) + 'px';
+    boxDiv.style.width = ((box[2] - box[0]) * scale) + 'px';
+    boxDiv.style.height = ((box[3] - box[1]) * scale) + 'px';
+}
+
+window.addEventListener('resize', () => {
+    document.querySelectorAll('.detection-box').forEach(boxDiv => {
+        const img = boxDiv.parentElement.querySelector('img');
+        if (img) placeBox(img, boxDiv);
+    });
+});
+
+function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function emptyState(icon, text) {
+    const div = document.createElement('div');
+    div.className = 'empty-state';
+    div.innerHTML = `<div class="empty-state-icon">${icon}</div><div class="empty-state-text"></div>`;
+    div.querySelector('.empty-state-text').textContent = text;
+    return div;
+}
+
+// ---------------------------------------------------------------------------
+// Video upload + progress polling
+// ---------------------------------------------------------------------------
+const videoInput = document.getElementById('videoFile');
+const videoLabel = videoInput.nextElementSibling;
+const videoFileText = videoLabel.querySelector('.file-text');
+videoFileText.dataset.originalText = videoFileText.textContent;
+updateFileLabel(videoInput, videoLabel);
+
+const STAGE_LABELS = {
+    queued: 'Queued',
+    waiting: 'Waiting for another ingestion to finish',
+    loading_models: 'Loading SAM + CLIP',
+    extracting: 'Extracting keyframes',
+    ingesting: 'Running SAM + CLIP on keyframes',
+    done: 'Done',
+    error: 'Failed',
+    skipped: 'Already indexed',
+};
+
+function fmtDuration(sec) {
+    sec = Math.round(sec || 0);
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return m ? `${m}m ${s}s` : `${s}s`;
+}
+
+function renderJob(job) {
+    const box = document.getElementById('videoProgress');
+    const label = document.getElementById('videoProgressLabel');
+    const fill = document.getElementById('videoProgressFill');
+    const detail = document.getElementById('videoProgressDetail');
+    box.hidden = false;
+    box.dataset.stage = job.stage;
+
+    const stage = STAGE_LABELS[job.stage] || job.stage;
+    label.textContent = `${job.video_name || ''} · ${stage}`;
+
+    let pct = 0;
+    if (job.stage === 'extracting' && job.total) pct = 30 * job.done / job.total;
+    else if (job.stage === 'ingesting' && job.total) pct = 30 + 70 * job.done / job.total;
+    else if (job.stage === 'done' || job.stage === 'skipped') pct = 100;
+    fill.style.width = pct.toFixed(1) + '%';
+
+    if (job.stage === 'extracting') {
+        detail.textContent = `Sampled ${job.done} / ~${job.total} frames · ${fmtDuration(job.elapsed_sec)} elapsed`;
+    } else if (job.stage === 'ingesting') {
+        detail.textContent = `Keyframe ${job.done} / ${job.total} · ${fmtDuration(job.elapsed_sec)} elapsed`;
+    } else if (job.stage === 'done') {
+        detail.textContent = `${job.message} Extraction ${job.extraction_sec.toFixed(1)} s, ` +
+            `SAM+CLIP ${fmtDuration(job.ingestion_sec)} (${job.mean_sec_per_keyframe.toFixed(1)} s per keyframe).`;
+    } else {
+        detail.textContent = job.message || '';
+    }
+}
+
+async function pollJob(jobId) {
+    while (true) {
+        await new Promise(r => setTimeout(r, 2000));
+        let job;
+        try {
+            const res = await fetch(`/video-status/${jobId}`);
+            job = await res.json();
+        } catch (e) {
+            continue; // server busy (e.g. reloading); try again
+        }
+        renderJob(job);
+        if (job.stage === 'done' || job.stage === 'error') {
+            if (job.stage === 'done') loadVideoList();
+            return job;
+        }
+    }
+}
+
+document.getElementById('videoForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (videoInput.files.length === 0) return;
+
+    const submitBtn = document.getElementById('videoSubmit');
+    submitBtn.disabled = true;
+    renderJob({ video_name: videoInput.files[0].name, stage: 'queued', message: 'Uploading video…' });
+
+    try {
+        const response = await fetch('/upload-video/', { method: 'POST', body: new FormData(e.target) });
+        const job = await response.json();
+        if (!response.ok) {
+            renderJob({ video_name: videoInput.files[0].name, stage: 'error', message: job.detail || 'Upload failed.' });
+            return;
+        }
+        renderJob(job);
+        e.target.reset();
+        videoFileText.textContent = videoFileText.dataset.originalText;
+        if (job.job_id) await pollJob(job.job_id);
+    } catch (error) {
+        renderJob({ video_name: '', stage: 'error', message: 'Upload failed. Please try again.' });
+    } finally {
+        submitBtn.disabled = false;
+    }
+});
+
+// Populate the "Search in" dropdown with indexed videos
+async function loadVideoList() {
+    const select = document.getElementById('sourceFilter');
+    try {
+        const res = await fetch('/videos/');
+        const data = await res.json();
+        const current = select.value;
+        select.querySelectorAll('option[data-video]').forEach(o => o.remove());
+        (data.videos || []).forEach(v => {
+            const opt = document.createElement('option');
+            opt.value = v.source_video;
+            opt.dataset.video = '1';
+            opt.textContent = `${v.name} (${v.keyframes} keyframes)`;
+            select.appendChild(opt);
+        });
+        select.value = [...select.options].some(o => o.value === current) ? current : '';
+    } catch (e) { /* ignore: list is optional */ }
+}
+loadVideoList();
 
 // Show message helper
 function showMessage(element, text, type = 'info') {
@@ -258,3 +429,4 @@ const setupDragAndDrop = (input, label) => {
 
 setupDragAndDrop(uploadInput, uploadLabel);
 setupDragAndDrop(queryImageInput, queryImageLabel);
+setupDragAndDrop(videoInput, videoLabel);

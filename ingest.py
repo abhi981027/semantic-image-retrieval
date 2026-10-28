@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import torch
 import faiss
 import numpy as np
@@ -7,7 +8,37 @@ from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 import argparse
-from typing import List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
+from device_utils import get_device, free_device_memory
+
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
+SAM_MODEL_TYPE = "vit_b"
+SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+
+MAX_OBJECTS_PER_IMAGE = 12
+MIN_OBJECT_AREA_FRAC = 0.1   # drop masks smaller than 10% of the image area
+MIN_STABILITY = 0.85
+OBJECT_NMS_IOU = 0.8
+
+# Phase 1 used two SAM settings: a higher-quality one for single uploads and a
+# faster one for batch/directory ingestion. Both are kept unchanged.
+SAM_PARAMS_QUALITY = dict(
+    points_per_side=32,
+    pred_iou_thresh=0.86,
+    stability_score_thresh=0.92,
+    box_nms_thresh=0.7,
+    min_mask_region_area=1000,
+)
+SAM_PARAMS_FAST = dict(
+    points_per_side=16,
+    pred_iou_thresh=0.86,
+    stability_score_thresh=0.92,
+    box_nms_thresh=0.7,
+    min_mask_region_area=5000,
+)
+
 
 def _xywh_to_xyxy(box: List[int]) -> List[int]:
     x, y, w, h = box
@@ -50,330 +81,265 @@ def _prepare_pil(img: Image.Image) -> Image.Image:
     return img
 
 def get_sam_model(device):
-    sam_checkpoint = "sam_vit_b_01ec64.pth"
-    model_type = "vit_b"
-    sam_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-    
-    if not os.path.exists(sam_checkpoint):
+    if not os.path.exists(SAM_CHECKPOINT):
         import requests
-        print(f"Downloading SAM checkpoint from {sam_url}...")
-        response = requests.get(sam_url, stream=True)
-        with open(sam_checkpoint, "wb") as f:
+        print(f"Downloading SAM checkpoint from {SAM_URL}...")
+        response = requests.get(SAM_URL, stream=True)
+        with open(SAM_CHECKPOINT, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         print("Download complete.")
 
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=SAM_CHECKPOINT)
     sam.to(device=device)
     return sam
 
-def ingest_single_image(image_path, index_path, metadata_path):
+
+class SafeMaskGenerator:
     """
-    Original function to ingest a single image, loading and unloading models.
-    This is kept for completeness but is slower for multiple images.
+    Wraps SamAutomaticMaskGenerator and falls back to CPU if SAM fails on MPS.
+
+    segment_anything's automatic mask generator creates float64 tensors internally,
+    which Apple's MPS backend does not support. Rather than guessing, we try the
+    requested device first and permanently switch SAM to CPU on the first failure.
+    CLIP stays on MPS either way.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
 
-    # --- SAM PART: Generate Masks ---
-    print("Loading SAM model to generate masks...")
-    sam = get_sam_model(device)
-    # Tune SAM to reduce tiny/unstable masks
-    mask_generator = SamAutomaticMaskGenerator(
-        sam,
-        points_per_side=32,
-        pred_iou_thresh=0.86,
-        stability_score_thresh=0.92,
-        box_nms_thresh=0.7,
-        min_mask_region_area=1000,  # roughly filter small fragments
-    )
-    
-    image = Image.open(image_path).convert("RGB")
-    image_np = np.array(image)
-    masks = mask_generator.generate(image_np)
-    
-    del sam
-    del mask_generator
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-    print("SAM model unloaded.")
+    def __init__(self, device: str, sam_params: dict):
+        self.device = device
+        self.sam_params = sam_params
+        self._build(device)
 
-    # --- CLIP PART: Generate Embeddings ---
-    print("Loading CLIP model to generate embeddings...")
-    clip_model_name = "openai/clip-vit-base-patch32"
-    clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
-    clip_model.eval()
-    clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+    def _build(self, device: str):
+        self.device = device
+        self.sam = get_sam_model(device)
+        self.generator = SamAutomaticMaskGenerator(self.sam, **self.sam_params)
 
-    new_embeddings = []
-    new_metadata_entries = {}
+    def generate(self, image_np: np.ndarray):
+        try:
+            return self.generator.generate(image_np)
+        except (TypeError, RuntimeError, NotImplementedError) as e:
+            if self.device == "cpu":
+                raise
+            print(f"SAM failed on {self.device} ({e}). Falling back to CPU for SAM.")
+            del self.generator, self.sam
+            free_device_memory(self.device)
+            self._build("cpu")
+            return self.generator.generate(image_np)
 
-    # 1. Global embedding
-    img_for_clip = _prepare_pil(image)
-    # Force channels_last to avoid ambiguity on tiny images (e.g., 1xN or Nx1)
-    inputs = clip_processor(images=img_for_clip, return_tensors="pt", input_data_format="channels_last").to(device)
+
+class IngestModels:
+    """SAM + CLIP loaded once and reused across many images/frames."""
+
+    def __init__(self, device: Optional[str] = None, sam_params: Optional[dict] = None):
+        self.device = device or get_device()
+        print(f"Using device: {self.device}")
+        print("Loading SAM model...")
+        self.mask_generator = SafeMaskGenerator(self.device, sam_params or SAM_PARAMS_FAST)
+        print("Loading CLIP model...")
+        self.clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(self.device)
+        self.clip_model.eval()
+        self.clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+
+    def unload(self):
+        del self.mask_generator, self.clip_model, self.clip_processor
+        free_device_memory(self.device)
+        print("Models unloaded.")
+
+
+def clip_image_embeddings(images: List[Image.Image], clip_model, clip_processor, device) -> np.ndarray:
+    """Batch CLIP image embeddings, L2-normalised -> (N, 512) float32."""
+    inputs = clip_processor(
+        images=[_prepare_pil(im) for im in images],
+        return_tensors="pt",
+        # Force channels_last to avoid ambiguity on tiny images (e.g., 1xN or Nx1)
+        input_data_format="channels_last",
+    ).to(device)
     with torch.no_grad():
-        image_features = clip_model.get_image_features(**inputs)
-        # L2-normalize for cosine/IP search
-        image_features = torch.nn.functional.normalize(image_features, dim=-1)
-    
-    global_embedding = image_features.cpu().numpy().astype("float32").flatten()
-    new_embeddings.append(global_embedding)
-    new_metadata_entries[0] = {"image_path": image_path, "type": "global", "box": None}
+        feats = clip_model.get_image_features(**inputs)
+        feats = torch.nn.functional.normalize(feats, dim=-1)
+    return feats.cpu().numpy().astype("float32")
 
-    # 2. Object embeddings
-    # First, filter masks by area and stability, then run NMS to remove dupes
-    W, H = image.size
-    img_area = W * H
+
+def select_object_boxes(masks, img_w: int, img_h: int) -> List[List[int]]:
+    """Area/stability filters -> NMS -> top-N boxes in [x1, y1, x2, y2]."""
+    img_area = img_w * img_h
     candidate_boxes: List[List[int]] = []
     candidate_scores: List[float] = []
     for mask_data in masks:
-        box_xywh = [int(round(v)) for v in mask_data['bbox']]
-        x, y, w, h = box_xywh
-        # Basic validity
+        x, y, w, h = [int(round(v)) for v in mask_data['bbox']]
         if w <= 2 or h <= 2:
             continue
         area = mask_data.get('area', w * h)
         stability = mask_data.get('stability_score', 1.0)
         pred_iou = mask_data.get('predicted_iou', 1.0)
-        # Drop tiny or unstable masks (e.g., < 1% of image area)
-        if area < 0.1 * img_area:
+        if area < MIN_OBJECT_AREA_FRAC * img_area:
             continue
-        if stability < 0.85:
+        if stability < MIN_STABILITY:
             continue
         candidate_boxes.append(_xywh_to_xyxy([x, y, w, h]))
         # Prefer higher IoU/stability
         candidate_scores.append(0.7 * pred_iou + 0.3 * stability)
 
-    keep_idx = _nms(candidate_boxes, candidate_scores, iou_thresh=0.8)
-    # Keep only the top-N highest scoring boxes to avoid background clutter
-    MAX_OBJECTS_PER_IMAGE = 12
-    keep_idx = keep_idx[:MAX_OBJECTS_PER_IMAGE]
+    keep_idx = _nms(candidate_boxes, candidate_scores, iou_thresh=OBJECT_NMS_IOU)
+    keep_idx = keep_idx[:MAX_OBJECTS_PER_IMAGE]  # NMS returns indices sorted by score
+    return [[int(v) for v in candidate_boxes[k]] for k in keep_idx]
 
-    for i_keep, k in enumerate(keep_idx):
-        x1, y1, x2, y2 = candidate_boxes[k]
-        # Crop and sanitize image for CLIP
-        cropped_image = image.crop((x1, y1, x2, y2))
-        cropped_image = _prepare_pil(cropped_image)
 
-        # Force channels_last to avoid ambiguity on extremely small crops
-        inputs = clip_processor(images=cropped_image, return_tensors="pt", input_data_format="channels_last").to(device)
-        with torch.no_grad():
-            image_features = clip_model.get_image_features(**inputs)
-            image_features = torch.nn.functional.normalize(image_features, dim=-1)
-        
-        object_embedding = image_features.cpu().numpy().astype("float32").flatten()
-        new_embeddings.append(object_embedding)
-        new_metadata_entries[i_keep + 1] = {"image_path": image_path, "type": "object", "box": [int(x1), int(y1), int(x2), int(y2)]}
+def embed_image(image: Image.Image, models: IngestModels) -> List[Tuple[np.ndarray, str, Optional[List[int]]]]:
+    """
+    Returns [(embedding, type, box), ...]: one global entry followed by object entries.
+    Global + object crops are encoded by CLIP in a single batch.
+    """
+    image = _prepare_pil(image)
+    masks = models.mask_generator.generate(np.array(image))
+    W, H = image.size
+    boxes = select_object_boxes(masks, W, H)
+    crops = [image.crop(tuple(b)) for b in boxes]
+    embs = clip_image_embeddings([image] + crops, models.clip_model, models.clip_processor, models.device)
+    out = [(embs[0], "global", None)]
+    out += [(embs[i + 1], "object", boxes[i]) for i in range(len(boxes))]
+    return out
 
-    del clip_model
-    del clip_processor
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-    print("CLIP model unloaded.")
 
-    # --- Update FAISS Index and Metadata ---
-    if not new_embeddings:
-        print("No embeddings were generated for this image.")
-        return
-
-    embedding_dim = new_embeddings[0].shape[0]
-    
+def _load_index_and_metadata(index_path: str, metadata_path: str, dim: int):
     if os.path.exists(index_path):
-        print("Loading existing FAISS index...")
         index = faiss.read_index(index_path)
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        start_id = max(map(int, metadata.keys())) + 1 if metadata else 0
+        metadata = {}
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+        if len(metadata) != index.ntotal:
+            print(f"WARNING: metadata has {len(metadata)} entries but index has {index.ntotal} vectors.")
     else:
         print("Creating new FAISS index (Inner Product / cosine)...")
-        index = faiss.IndexFlatIP(embedding_dim)
+        index = faiss.IndexFlatIP(dim)
         metadata = {}
-        start_id = 0
+    return index, metadata
 
-    embeddings_np = np.array(new_embeddings, dtype='float32')
-    index.add(embeddings_np)
-    
-    for i, meta in new_metadata_entries.items():
-        metadata[start_id + i] = meta
 
+def _atomic_write_json(obj, path: str):
+    tmp = path + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(obj, f, indent=4)
+    os.replace(tmp, path)
+
+
+def append_to_index(embeddings: List[np.ndarray], entries: List[dict], index_path: str, metadata_path: str) -> int:
+    """Add vectors + metadata. FAISS IDs are positional, so new IDs start at index.ntotal."""
+    if not embeddings:
+        return 0
+    emb = np.asarray(embeddings, dtype='float32')
+    index, metadata = _load_index_and_metadata(index_path, metadata_path, emb.shape[1])
+    start_id = index.ntotal
+    index.add(emb)
+    for i, meta in enumerate(entries):
+        metadata[str(start_id + i)] = meta
     faiss.write_index(index, index_path)
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=4)
-    
-    print(f"Ingestion complete for {image_path}. Index and metadata updated.")
+    _atomic_write_json(metadata, metadata_path)
+    return len(entries)
+
+
+def ingest_image_list(
+    image_paths: List[str],
+    index_path: str,
+    metadata_path: str,
+    extra_metadata: Optional[List[Optional[dict]]] = None,
+    append: bool = True,
+    models: Optional[IngestModels] = None,
+    sam_params: Optional[dict] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> Dict:
+    """
+    Core ingestion routine used by image uploads, directory ingestion and video keyframes.
+
+    extra_metadata: optional list aligned with image_paths; each dict is merged into every
+        metadata entry (global + objects) generated from that image. Video keyframes use this
+        for {source_video, frame_number, timestamp_sec}. Image-only entries simply omit it,
+        so the Phase 1 schema {image_path, type, box} is unchanged.
+    append: add to the existing index (True) or start a fresh one (False).
+    models: pass pre-loaded IngestModels to reuse them; otherwise they're loaded and unloaded here.
+
+    Returns timing stats.
+    """
+    if not append:
+        for p in (index_path, metadata_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    own_models = models is None
+    if own_models:
+        models = IngestModels(sam_params=sam_params)
+
+    all_embeddings: List[np.ndarray] = []
+    all_entries: List[dict] = []
+    per_image_sec: List[float] = []
+    failed = 0
+    n = len(image_paths)
+
+    try:
+        for i, image_path in enumerate(image_paths):
+            t0 = time.perf_counter()
+            try:
+                image = Image.open(image_path).convert("RGB")
+                results = embed_image(image, models)
+                extra = (extra_metadata[i] if extra_metadata else None) or {}
+                for emb, etype, box in results:
+                    all_embeddings.append(emb)
+                    all_entries.append({"image_path": image_path, "type": etype, "box": box, **extra})
+                print(f"[{i + 1}/{n}] {os.path.basename(image_path)}: {len(results)} embeddings "
+                      f"({time.perf_counter() - t0:.1f}s)")
+            except Exception as e:
+                failed += 1
+                print(f"Error processing {image_path}: {e}")
+            per_image_sec.append(time.perf_counter() - t0)
+            if progress_cb:
+                progress_cb(i + 1, n)
+    finally:
+        if own_models:
+            models.unload()
+
+    added = append_to_index(all_embeddings, all_entries, index_path, metadata_path)
+    if added == 0:
+        print("No embeddings were generated.")
+    return {
+        "images": n,
+        "failed": failed,
+        "embeddings_added": added,
+        "total_sec": float(sum(per_image_sec)),
+        "mean_sec_per_image": float(np.mean(per_image_sec)) if per_image_sec else 0.0,
+        "per_image_sec": per_image_sec,
+    }
+
+
+def ingest_single_image(image_path, index_path, metadata_path, extra_metadata: Optional[dict] = None):
+    """
+    Ingest one image into the existing index (Phase 1 behaviour: higher-quality SAM settings,
+    models loaded and unloaded for this call).
+    """
+    return ingest_image_list(
+        [image_path], index_path, metadata_path,
+        extra_metadata=[extra_metadata] if extra_metadata else None,
+        append=True, sam_params=SAM_PARAMS_QUALITY,
+    )
+
 
 def ingest_images_directory(images_dir, index_path, metadata_path):
     """
     Processes all images in a directory, loading models only once.
-    This clears any existing index/metadata files.
+    This clears any existing index/metadata files (Phase 1 behaviour).
     """
-    image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    image_files = sorted(f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg')))
     if not image_files:
         print("No images found in the specified directory.")
-        return
-        
-    # For a full directory ingestion, clear old files
-    if os.path.exists(index_path):
-        os.remove(index_path)
-    if os.path.exists(metadata_path):
-        os.remove(metadata_path)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    # --- 1. Load models ONCE ---
-    print("Loading SAM model...")
-    sam = get_sam_model(device)
-    
-    print("Using faster SAM parameters (points_per_side=16, min_mask_region_area=5000)")
-    mask_generator = SamAutomaticMaskGenerator(
-        sam,
-        points_per_side=16, 
-        pred_iou_thresh=0.86,
-        stability_score_thresh=0.92,
-        box_nms_thresh=0.7,
-        min_mask_region_area=5000,
-    )
-    
-    print("Loading CLIP model...")
-    clip_model_name = "openai/clip-vit-base-patch32"
-    clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
-    clip_model.eval()
-    clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
-    print(device)
-
-    all_embeddings = []
-    all_metadata = {}
-    current_id = 0
-    embedding_dim = -1
-
-    # --- 2. Process all images in a loop ---
-    for image_file in image_files:
-        image_path = os.path.join(images_dir, image_file)
-        print(f"\n--- Processing {image_file} ---")
-
-        try:
-            image = Image.open(image_path).convert("RGB")
-            image_np = np.array(image)
-            W, H = image.size
-            img_area = W * H
-
-            # --- SAM Part ---
-            masks = mask_generator.generate(image_np)
-
-            # --- CLIP Part: Global Embedding ---
-            img_for_clip = _prepare_pil(image)
-            inputs = clip_processor(images=img_for_clip, return_tensors="pt", input_data_format="channels_last").to(device)
-            with torch.no_grad():
-                image_features = clip_model.get_image_features(**inputs)
-                image_features = torch.nn.functional.normalize(image_features, dim=-1)
-            
-            global_embedding = image_features.cpu().numpy().astype("float32").flatten()
-            
-            if embedding_dim == -1:
-                embedding_dim = global_embedding.shape[0]
-
-            all_embeddings.append(global_embedding)
-            all_metadata[current_id] = {"image_path": image_path, "type": "global", "box": None}
-            current_id += 1
-
-            # --- CLIP Part: Object Candidates ---
-            candidate_boxes: List[List[int]] = []
-            candidate_scores: List[float] = []
-            
-            for mask_data in masks:
-                box_xywh = [int(round(v)) for v in mask_data['bbox']]
-                x, y, w, h = box_xywh
-                if w <= 2 or h <= 2:
-                    continue
-                area = mask_data.get('area', w * h)
-                stability = mask_data.get('stability_score', 1.0)
-                pred_iou = mask_data.get('predicted_iou', 1.0)
-                
-                # Keep stability/area filters
-                if area < 0.1 * img_area: # Use a relative filter
-                    continue
-                if stability < 0.85:
-                    continue
-                
-                candidate_boxes.append(_xywh_to_xyxy([x, y, w, h]))
-                candidate_scores.append(0.7 * pred_iou + 0.3 * stability)
-
-            keep_idx = _nms(candidate_boxes, candidate_scores, iou_thresh=0.8)
-            MAX_OBJECTS_PER_IMAGE = 12
-            # NMS returns items sorted by score
-            keep_idx = keep_idx[:MAX_OBJECTS_PER_IMAGE]
-
-            # *** MODIFICATION: Batch process object embeddings ***
-            cropped_images_for_clip = []
-            final_boxes = []
-
-            for k in keep_idx:
-                x1, y1, x2, y2 = candidate_boxes[k]
-                cropped_image = image.crop((x1, y1, x2, y2))
-                cropped_images_for_clip.append(_prepare_pil(cropped_image))
-                final_boxes.append([int(x1), int(y1), int(x2), int(y2)])
-            
-            if cropped_images_for_clip:
-                # Process all cropped images in one single batch
-                inputs = clip_processor(
-                    images=cropped_images_for_clip, 
-                    return_tensors="pt", 
-                    padding=True, # Pad to same size for batching
-                    truncation=True, # Truncate if needed
-                    input_data_format="channels_last"
-                ).to(device)
-                
-                with torch.no_grad():
-                    image_features_batch = clip_model.get_image_features(**inputs)
-                    image_features_batch = torch.nn.functional.normalize(image_features_batch, dim=-1)
-                
-                object_embeddings_batch = image_features_batch.cpu().numpy().astype("float32")
-                
-                # Add batch results to our main lists
-                for i, embedding in enumerate(object_embeddings_batch):
-                    all_embeddings.append(embedding)
-                    all_metadata[current_id] = {
-                        "image_path": image_path, 
-                        "type": "object", 
-                        "box": final_boxes[i]
-                    }
-                    current_id += 1
-            
-            print(f"Found {len(cropped_images_for_clip) + 1} total embeddings for {image_file}.")
-
-        except Exception as e:
-            print(f"Error processing {image_path}: {e}")
-
-    # --- 3. Unload models ONCE ---
-    del sam, mask_generator, clip_model, clip_processor
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-    print("\nModels unloaded.")
-
-    if not all_embeddings:
-        print("No embeddings were generated for the entire directory.")
-        return
-
-    print(f"Creating FAISS index for {len(all_embeddings)} total embeddings...")
-    embeddings_np = np.array(all_embeddings, dtype='float32')
-    
-    # Ensure all embeddings have the same dimension
-    if embeddings_np.ndim != 2 or embeddings_np.shape[1] != embedding_dim:
-        print(f"Error: Embedding dimensions are inconsistent. Expected {embedding_dim}, but got shape {embeddings_np.shape}")
-        return
-
-    index = faiss.IndexFlatIP(embedding_dim)
-    index.add(embeddings_np)
-    
-    faiss.write_index(index, index_path)
-    with open(metadata_path, 'w') as f:
-        json.dump(all_metadata, f, indent=4)
-    
+        return None
+    paths = [os.path.join(images_dir, f) for f in image_files]
+    stats = ingest_image_list(paths, index_path, metadata_path, append=False, sam_params=SAM_PARAMS_FAST)
     print(f"Ingestion complete. Processed {len(image_files)} images.")
     print(f"Index saved to: {index_path}")
     print(f"Metadata saved to: {metadata_path}")
+    return stats
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest images and create embeddings.")

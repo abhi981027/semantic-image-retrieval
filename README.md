@@ -181,6 +181,83 @@ Each entry in `metadata.json` maps a FAISS index ID to image information:
 - **type**: `global` (whole image) or `object` (detected region)
 - **box**: Bounding box coordinates `[x1, y1, x2, y2]` for objects
 
+Entries that come from a video keyframe (Phase 2) carry three extra fields. Image-only
+entries are unchanged, so Phase 1 indexes keep working.
+
+```json
+{
+  "42": {
+    "image_path": "frames/surveillance/frame_001050.png",
+    "type": "object",
+    "box": [400, 200, 800, 600],
+    "source_video": "videos/surveillance.mp4",
+    "frame_number": 1050,
+    "timestamp_sec": 42.0
+  }
+}
+```
+
+## 🎬 Phase 2: Video Retrieval
+
+Upload a video, then search it with text or an image and get back timestamped keyframes
+with bounding boxes ("Source: surveillance.mp4 @ 0:42").
+
+### Pipeline
+
+1. **Frame sampling** (`video_ingest.py`): OpenCV reads the video and samples frames at
+   1 fps for clips up to 2 minutes and 0.5 fps for longer ones (configurable).
+2. **Keyframe selection**: each sampled frame is compared with the last kept keyframe and
+   dropped if similarity exceeds the threshold (default 0.95).
+   - `histogram`: HSV colour-histogram correlation. Fast, needs no model.
+   - `clip`: cosine similarity of CLIP embeddings. More semantic, slower.
+   - A keyframe is forced every `max_gap_sec` (default 10 s) so slow scene changes
+     (e.g. dashcam footage) are still covered.
+3. **Ingestion**: keyframes go through the same SAM → NMS → CLIP pipeline as images and are
+   appended to the index with `source_video`, `frame_number` and `timestamp_sec`.
+4. **Search**: results include the video fields; you can filter to one video (or to images
+   or videos only) and order results by timeline.
+
+### Usage
+
+```bash
+# Web UI: "Upload Video" section (runs in the background and shows progress)
+uvicorn app.main:app --reload
+
+# Command line
+python video_ingest.py --video videos/clip.mp4                 # extract + index
+python video_ingest.py --video videos/clip.mp4 --extract-only  # keyframes only
+python search.py --text "a red car" --source clip.mp4 --sort time
+```
+
+### API
+
+| Endpoint | Description |
+|---|---|
+| `POST /upload-video/` | Form fields: `file`, `method` (`histogram`/`clip`), `fps` (0 = auto), `similarity_threshold`, `max_gap_sec` (0 = off), `max_keyframes` (0 = no cap). Returns a `job_id`. |
+| `GET /video-status/{job_id}` | Stage (`extracting` → `ingesting` → `done`), progress and timing stats |
+| `GET /videos/` | Indexed videos and their keyframe counts |
+| `POST /search/` | Now also accepts `source_filter` (video path/filename, `images` or `videos`) and `sort_by` (`score`/`time`). Video results include `video_name`, `timestamp`, `timestamp_sec`, `frame_number`. |
+
+### Benchmarking
+
+```bash
+# Extraction only (seconds): sampled frames, keyframes, reduction ratio, throughput
+python benchmark_video.py --videos videos/*.mp4 --extract-only
+
+# Full run: + SAM/CLIP time per keyframe, search latency, Phase 1 image baseline
+python benchmark_video.py --videos videos/*.mp4 --methods histogram clip --images images/ --max-keyframes 20
+```
+
+Results are written to `benchmarks/<timestamp>/results.json` and `summary.md`, using a
+separate index so the app's index is not modified.
+
+### Apple Silicon notes
+
+- Device order is CUDA → MPS → CPU (`device_utils.get_device()`); force one with
+  `EDGESEEK_DEVICE=cpu`.
+- If SAM's automatic mask generator fails on MPS, it automatically falls back to CPU for SAM
+  (CLIP stays on MPS).
+
 ## Advanced Features
 
 ### Result Diversification

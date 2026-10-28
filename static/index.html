@@ -8,14 +8,14 @@
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
-    <link rel="stylesheet" href="static\styles.css">
+    <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
     <div class="container">
         <header class="header">
             <div class="logo">
 
-                <h1>Semantic Image Retrieval</h1>
+                <h1>Semantic Image &amp; Video Retrieval</h1>
             </div>
         </header>
 
@@ -45,6 +45,62 @@
                 </button>
             </form>
             <div id="uploadMessage" class="message"></div>
+        </section>
+
+        <section class="glass-card upload-section">
+            <div class="section-header">
+                <div class="icon-wrapper">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <rect x="2" y="5" width="15" height="14" rx="2" stroke-width="2"/>
+                        <path d="M17 10l5-3v10l-5-3" stroke-width="2" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <h2>Upload Video</h2>
+            </div>
+            <form id="videoForm" action="#" method="post" enctype="multipart/form-data">
+                <div class="file-input-wrapper">
+                    <input type="file" name="file" id="videoFile" required accept="video/mp4,video/x-msvideo,video/quicktime,video/x-matroska,.mp4,.avi,.mov,.mkv,.m4v">
+                    <label for="videoFile" class="file-input-label">
+                        <span class="file-icon">🎬</span>
+                        <span class="file-text">Choose a video or drag & drop</span>
+                        <span class="file-hint">MP4, AVI, MOV, MKV. Keyframes are extracted, then indexed with SAM + CLIP</span>
+                    </label>
+                </div>
+                <details class="video-options">
+                    <summary>Keyframe settings</summary>
+                    <div class="options-grid">
+                        <label>Selection method
+                            <select name="method">
+                                <option value="histogram" selected>Colour histogram (fast)</option>
+                                <option value="clip">CLIP embedding (semantic, slower)</option>
+                            </select>
+                        </label>
+                        <label>Sampling fps <span class="hint">0 = auto (1 fps ≤ 2 min, else 0.5)</span>
+                            <input type="number" name="fps" value="0" min="0" max="10" step="0.1">
+                        </label>
+                        <label>Similarity threshold <span class="hint">skip frames more similar than this</span>
+                            <input type="number" name="similarity_threshold" value="0.95" min="0.5" max="1" step="0.01">
+                        </label>
+                        <label>Max gap (s) <span class="hint">force a keyframe after this long; 0 = off</span>
+                            <input type="number" name="max_gap_sec" value="10" min="0" step="1">
+                        </label>
+                        <label>Max keyframes <span class="hint">0 = no cap</span>
+                            <input type="number" name="max_keyframes" value="0" min="0" step="1">
+                        </label>
+                    </div>
+                </details>
+                <button type="submit" class="btn btn-primary" id="videoSubmit">
+                    <span>Upload & Index Video</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M5 12h14M12 5l7 7-7 7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </form>
+            <div id="videoProgress" class="video-progress" hidden>
+                <div class="progress-label" id="videoProgressLabel"></div>
+                <div class="progress-track"><div class="progress-fill" id="videoProgressFill"></div></div>
+                <div class="progress-detail" id="videoProgressDetail"></div>
+            </div>
         </section>
 
         <section class="glass-card search-section">
@@ -90,7 +146,23 @@
                         </label>
                     </div>
                 </div>
-                
+
+                <div class="search-options">
+                    <label>Search in
+                        <select name="source_filter" id="sourceFilter">
+                            <option value="">Everything</option>
+                            <option value="images">Images only</option>
+                            <option value="videos">All videos</option>
+                        </select>
+                    </label>
+                    <label>Order results by
+                        <select name="sort_by" id="sortBy">
+                            <option value="score" selected>Best match</option>
+                            <option value="time">Timeline (per video)</option>
+                        </select>
+                    </label>
+                </div>
+
                 <button type="submit" class="btn btn-secondary">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                         <circle cx="11" cy="11" r="8" stroke-width="2"/>
@@ -104,11 +176,12 @@
         <section class="results-container" id="resultsContainer" style="display: none;">
             <div class="section-header">
                 <h2>Search Results</h2>
+                <span class="results-summary" id="resultsSummary"></span>
             </div>
             <div id="results" class="results-grid"></div>
         </section>
     </div>
 
-    <script src="static/app.js"></script>
+    <script src="/static/app.js"></script>
 </body>
 </html>

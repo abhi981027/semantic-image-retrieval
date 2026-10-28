@@ -17,3 +17,10 @@ static/uploads/
 .github/
 .venv/
 a.py
+
+# Phase 2 (video) generated data
+videos/
+frames/
+benchmarks/*/frames/
+benchmarks/*/metadata_*.json
+*.tmp
